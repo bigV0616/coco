@@ -5,6 +5,7 @@
 import socket
 import threading
 import os
+import time
 
 from . import char
 from .config import config
@@ -24,6 +25,15 @@ class InteractiveServer:
     def __init__(self, client):
         self.client = client
         self.assets = None
+
+        self.total = 0
+        self.assets_list = []  # 分页获取用户资产列表
+        self.offset = 0
+        self.limit = 50
+        self.page = 1
+        self.page_size = 20
+        self.finish = False
+
         self.closed = False
         self._search_result = None
         self.nodes = None
@@ -132,7 +142,69 @@ class InteractiveServer:
         Display user all assets
         :return:
         """
-        self.search_and_display('')
+        # self.search_and_display('')
+        self.display_assets_paging()
+        self.display_banner()
+
+    def display_assets_paging(self, assets_list=None):
+        if assets_list is None:
+            assets_list = self.assets_list  # 默认展示用户所有的资产
+
+        gen_assets_per_page = self.get_assets_per_page(assets_list)
+        action = 'next'
+        while True:
+            # get assets
+            try:
+                page, assets = gen_assets_per_page.send(action)
+            except TypeError as e:
+                page, assets = next(gen_assets_per_page)
+                print(e)
+            except StopIteration:
+                print('stop iteration')
+                break
+
+            # display
+            self.client.send(char.CLEAR_CHAR)
+            self.page = page
+            self.search_result = assets
+            self.display_search_result()
+
+            # get user option
+            opt = net_input(self.client, prompt=':', before=0)
+            if opt == 'q':
+                break
+            elif opt == 'p':
+                action = 'pre'
+            else:
+                action = 'next'
+
+    def get_assets_per_page(self, assets_list):
+        left = 0
+        page = 1
+        while True:
+            right = left + self.page_size
+            assets = assets_list[left:right]
+
+            if assets_list is self.assets_list:
+                if self.finish and not assets:
+                    print('finish and not assets..')
+                    return None, None
+                elif not self.finish and not assets:
+                    time.sleep(1)
+                    continue
+            else:
+                if not assets:
+                    return None, None
+
+            action = yield (page, assets)
+
+            if action == 'pre':
+                if page > 1:  # 有多页
+                    left = left - len(assets)
+                    page -= 1
+            else:
+                left += len(assets)  # self.assets_list 还没及时获取到，保证资产连续进行
+                page += 1
 
     def display_nodes(self):
         if self.nodes is None:
@@ -163,25 +235,20 @@ class InteractiveServer:
             self.display_nodes()
             return
 
-        self.search_result = self.nodes[_id - 1].assets_granted
-        self.display_search_result()
+        # self.search_result = self.nodes[_id - 1].assets_granted
+        # self.display_search_result()
+        self.display_assets_paging(self.nodes[_id - 1].assets_granted)
 
     def display_search_result(self):
         sort_by = config["ASSET_LIST_SORT_BY"]
         self.search_result = sort_assets(self.search_result, sort_by)
         fake_data = [_("ID"), _("Hostname"), _("IP"), _("LoginAs")]
         id_length = max(len(str(len(self.search_result))), 4)
-        hostname_length = item_max_length(self.search_result, 15,
-                                          key=lambda x: x.hostname)
-        sysuser_length = item_max_length(self.search_result,
-                                         key=lambda x: x.system_users_name_list)
+        hostname_length = item_max_length(self.search_result, 15, key=lambda x: x.hostname)
+        sysuser_length = item_max_length(self.search_result, key=lambda x: x.system_users_name_list)
         size_list = [id_length, hostname_length, 16, sysuser_length]
         header_without_comment = format_with_zh(size_list, *fake_data)
-        comment_length = max(
-            self.client.request.meta["width"] -
-            size_of_str_with_zh(header_without_comment) - 1,
-            2
-        )
+        comment_length = max(self.client.request.meta["width"] - size_of_str_with_zh(header_without_comment) - 1, 2)
         size_list.append(comment_length)
         fake_data.append(_("Comment"))
         self.client.send(wr(title(format_with_zh(size_list, *fake_data))))
@@ -191,9 +258,8 @@ class InteractiveServer:
                 asset.system_users_name_list, asset.comment
             ]
             self.client.send(wr(format_with_zh(size_list, *data)))
-        self.client.send(wr(_("Total: {} Match: {}").format(
-            len(self.assets), len(self.search_result)), before=1)
-        )
+        # self.client.send(wr(_("Total: {} Match: {}").format(len(self.assets), len(self.search_result)), before=1))
+        self.client.send(wr(_("Page: {} Current: {}").format(self.page, len(self.search_result)), before=1))
 
     def search_and_display(self, q):
         self.search_assets(q)
@@ -223,8 +289,25 @@ class InteractiveServer:
             self.client.user, len(self.assets))
         )
 
+    def get_user_assets_pagination(self):
+        while not self.closed:
+            assets = app_service.get_user_assets_pagination(
+                self.client.user, offset=self.offset, limit=self.limit
+            )
+            logger.info('Assets length: {}'.format(len(assets)))
+            if not assets:
+                self.finish = True
+                logger.info('Get user assets pagination is finished.')
+                break
+            self.assets_list.extend(assets)
+            self.offset += self.limit
+
     def get_user_assets_async(self):
         thread = threading.Thread(target=self.get_user_assets)
+        thread.start()
+
+    def get_user_assets_pagination_async(self):
+        thread = threading.Thread(target=self.get_user_assets_pagination)
         thread.start()
 
     def choose_system_user(self, system_users):
@@ -275,6 +358,7 @@ class InteractiveServer:
 
     def interact(self):
         self.display_banner()
+        self.get_user_assets_pagination_async()
         while not self.closed:
             try:
                 opt = net_input(self.client, prompt='Opt> ', before=1)
